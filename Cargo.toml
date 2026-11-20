@@ -5,3 +5,7 @@ edition = "2024"
 rust-version = "1.92"
 
 [dependencies]
+arrow-array = "57"
+arrow-schema = "57"
+parquet = { version = "57", features = ["arrow"] }
+serde_json = "1"

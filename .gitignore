@@ -1,2 +1,7 @@
 /target/
 /.cargo-home/
+
+/.venv/
+
+__pycache__/
+*.pyc
