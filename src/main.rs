@@ -17,7 +17,7 @@ fn files(dir: &Path) -> Result<Vec<PathBuf>> {
     paths.sort();
     Ok(paths)
 }
-fn read_rows(path: &Path, count: usize, mut f: impl FnMut(Vec<&str>) -> Result<()>) -> Result<()> {
+fn read_rows(path: &Path, count: usize, mut f: impl FnMut(Vec<&str>, &str) -> Result<()>) -> Result<()> {
     let mut reader = BufReader::new(File::open(path)?);
     let mut line = String::new();
     reader.read_line(&mut line)?; // header
@@ -25,17 +25,17 @@ fn read_rows(path: &Path, count: usize, mut f: impl FnMut(Vec<&str>) -> Result<(
         line.clear();
         if reader.read_line(&mut line)? == 0 { break; }
         if line.ends_with('\n') { line.pop(); }
-        if let Some(row) = parse_line(&line, count) { f(row)?; }
+        if let Some(row) = parse_line(&line, count) { f(row, &line)?; }
     }
     Ok(())
 }
 fn dimensions(path: &Path) -> Result<HashMap<String, String>> {
     let mut result = HashMap::new();
-    read_rows(path, 2, |r| { result.insert(r[0].into(), r[1].into()); Ok(()) })?;
+    read_rows(path, 2, |r, _line| { result.insert(r[0].into(), r[1].into()); Ok(()) })?;
     Ok(result)
 }
 #[derive(Clone)]
-struct RawEvent { user: String, ts: String, ingest: String, kind: String, product: String, price: String }
+struct RawEvent { line: String, ingest: i64 }
 struct Event { ts: i64, revenue: i64, category: Option<String> }
 struct Click { ts: i64, id: String, campaign: String }
 #[derive(Default)]
@@ -60,6 +60,9 @@ fn string_field(name: &str, nullable: bool) -> Field { Field::new(name, DataType
 fn int_field(name: &str) -> Field { Field::new(name, DataType::Int64, false) }
 fn main() { if let Err(e) = run() { eprintln!("shopping-sessions: {e}"); std::process::exit(1); } }
 fn run() -> Result<()> {
+    let mut timer = std::time::Instant::now();
+    let timing = env::var_os("SHOPPING_TIMING").is_some();
+    macro_rules! mark { ($label:expr) => { if timing { eprintln!("{}: {:.3}s", $label, timer.elapsed().as_secs_f64()); timer = std::time::Instant::now(); } }; }
     let data = PathBuf::from(env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let output = PathBuf::from(env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let manifest: serde_json::Value = serde_json::from_reader(File::open(data.join("manifest.json"))?)?;
@@ -68,31 +71,35 @@ fn run() -> Result<()> {
     let products = dimensions(&data.join("products.csv"))?;
     let campaigns = dimensions(&data.join("campaigns.csv"))?;
     let mut links = Links::default();
-    for path in files(&data.join("links"))? { read_rows(&path, 2, |r| { links.join(r[0], r[1]); Ok(()) })?; }
+    for path in files(&data.join("links"))? { read_rows(&path, 2, |r, _line| { links.join(r[0], r[1]); Ok(()) })?; }
+    mark!("dimensions and links");
     let mut raw_events = HashMap::<String, RawEvent>::new();
-    for path in files(&data.join("events"))? { read_rows(&path, 7, |r| {
+    for path in files(&data.join("events"))? { read_rows(&path, 7, |r, _line| {
         if !r[0].is_empty() {
-            let replace = raw_events.get(r[0]).is_none_or(|old| r[3] < old.ingest.as_str());
-            if replace { raw_events.insert(r[0].into(), RawEvent { user:r[1].into(), ts:r[2].into(), ingest:r[3].into(), kind:r[4].into(), product:r[5].into(), price:r[6].into() }); }
+            // Ingest timestamps are guaranteed valid by the input contract.
+            let ingest = parse_ms(r[3]).ok_or("bad ingest timestamp")?;
+            let replace = raw_events.get(r[0]).is_none_or(|old| ingest < old.ingest);
+            if replace { raw_events.insert(r[0].into(), RawEvent { line: _line.to_owned(), ingest }); }
         } Ok(())
     })?; }
+    mark!("read and deduplicate events");
     let mut events = HashMap::<String, Vec<Event>>::new();
     for (_, e) in raw_events {
-        if e.user.is_empty() || e.product.is_empty() { continue; }
-        let Some(ts) = parse_ms(&e.ts) else { continue; };
-        if ts < start || ts >= end { continue; }
-        let Some(ingest) = parse_ms(&e.ingest) else { continue; };
-        if ingest - ts > DAY { continue; }
-        let (revenue, category) = match e.kind.as_str() {
+        let r = parse_line(&e.line, 7).expect("stored row was parsed already");
+        if r[1].is_empty() || r[5].is_empty() { continue; }
+        let Some(ts) = parse_ms(r[2]) else { continue; };
+        if ts < start || ts >= end || e.ingest - ts > DAY { continue; }
+        let (revenue, category) = match r[4] {
             "view" | "cart" => (0, None),
-            "purchase" => { let Some(p) = price(&e.price) else { continue; }; (p, Some(products.get(&e.product).cloned().unwrap_or_else(|| "unknown".into()))) },
+            "purchase" => { let Some(p) = price(r[6]) else { continue; }; (p, Some(products.get(r[5]).cloned().unwrap_or_else(|| "unknown".into()))) },
             _ => continue,
         };
-        events.entry(links.name(&e.user).to_owned()).or_default().push(Event { ts, revenue, category });
+        events.entry(links.name(r[1]).to_owned()).or_default().push(Event { ts, revenue, category });
     }
+    mark!("validate and group events");
     let mut seen = HashSet::new();
     let mut clicks = HashMap::<String, Vec<Click>>::new();
-    for path in files(&data.join("clicks"))? { read_rows(&path, 4, |r| {
+    for path in files(&data.join("clicks"))? { read_rows(&path, 4, |r, _line| {
         if r[0].is_empty() || !seen.insert(r[0].to_owned()) || r[1].is_empty() || !campaigns.contains_key(r[2]) { return Ok(()); }
         let Some(ts) = parse_ms(r[3]) else { return Ok(()); };
         if ts < start - WEEK || ts >= end { return Ok(()); }
@@ -100,6 +107,7 @@ fn run() -> Result<()> {
         Ok(())
     })?; }
     for list in clicks.values_mut() { list.sort_unstable_by(|a,b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id))); }
+    mark!("read and sort clicks");
     let mut users = BTreeMap::<(String, i32), UserDay>::new();
     let mut totals = BTreeMap::<(String, i32), CampaignDay>::new();
     for (person, mut list) in events {
@@ -135,6 +143,7 @@ fn run() -> Result<()> {
             i = j;
         }
     }
+    mark!("sessions and attribution");
     let mut user_ids = Vec::new(); let mut user_days = Vec::new(); let mut sessions = Vec::new(); let mut event_counts = Vec::new(); let mut revenues = Vec::new(); let mut categories = Vec::new();
     for ((id, day), u) in users {
         user_ids.push(id); user_days.push(day); sessions.push(u.sessions); event_counts.push(u.events); revenues.push(u.revenue);
@@ -146,5 +155,6 @@ fn run() -> Result<()> {
         channels.push(if id == "organic" { "organic".to_owned() } else { campaigns[&id].clone() }); ids.push(id); days.push(day); sessions.push(c.sessions); purchasing.push(c.purchasing); revenue.push(c.revenue); assists.push(c.assists);
     }
     write_table(&output.join("campaign_daily"), vec![string_field("campaign_id",false), string_field("channel",false), Field::new("day",DataType::Date32,false), int_field("sessions"), int_field("purchasing_sessions"), int_field("revenue_cents"), int_field("assisted_sessions")], vec![Arc::new(StringArray::from(ids)), Arc::new(StringArray::from(channels)), Arc::new(Date32Array::from(days)), Arc::new(Int64Array::from(sessions)), Arc::new(Int64Array::from(purchasing)), Arc::new(Int64Array::from(revenue)), Arc::new(Int64Array::from(assists))])?;
+    if timing { eprintln!("write output: {:.3}s", timer.elapsed().as_secs_f64()); }
     Ok(())
 }

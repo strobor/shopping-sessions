@@ -33,3 +33,5 @@ python3 scripts/compare.py /path/to/output /path/to/dev-answer
 ```
 
 The initial implementation holds events in memory and scans each session's qualifying clicks for assists. It is a correctness baseline and may exceed time or memory limits at scoring scale.
+
+Set `SHOPPING_TIMING=1` to print per-stage timings to stderr for local profiling. Timings are disabled by default.
