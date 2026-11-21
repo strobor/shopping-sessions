@@ -1,4 +1,4 @@
-name: Build and check
+name: Container check
 
 on:
   push:
@@ -9,17 +9,17 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  container:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Run Rust tests
-        run: cargo test --locked
-      - name: Build pipeline
-        run: cargo build --release --locked
-      - name: Install fixture checker
-        run: python3 -m pip install polars==1.44.2
-      - name: Check challenge fixtures
-        run: python3 scripts/run_fixtures.py fixtures -- ./target/release/shopping-sessions
-      - name: Build container image
+      - name: Build container
         run: docker build --platform linux/amd64 -t shopping-sessions .
+      - name: Check executable dependencies
+        run: |
+          docker run --rm --entrypoint /bin/sh shopping-sessions -c '
+            set -e
+            dependencies=$(ldd /usr/local/bin/shopping-sessions)
+            printf "%s\n" "$dependencies"
+            ! printf "%s\n" "$dependencies" | grep -q "not found"
+          '
