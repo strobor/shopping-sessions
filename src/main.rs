@@ -1,4 +1,4 @@
-use std::{collections::{BTreeMap, HashMap, HashSet}, env, error::Error, fs::{self, File}, io::{BufRead, BufReader}, path::{Path, PathBuf}, sync::Arc};
+use std::{collections::{HashMap, HashSet}, env, error::Error, fs::{self, File}, io::{BufRead, BufReader}, path::{Path, PathBuf}, sync::Arc};
 use arrow_array::{ArrayRef, Date32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
@@ -129,41 +129,58 @@ fn run() -> Result<()> {
     })?; }
     for list in clicks.values_mut() { list.sort_unstable_by(|a,b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id))); }
     mark!("read and sort clicks");
-    let mut users = BTreeMap::<(String, i32), UserDay>::new();
-    let mut totals = BTreeMap::<(String, i32), CampaignDay>::new();
-    for (person, mut list) in events {
-        list.sort_unstable_by_key(|e| e.ts);
-        let person_clicks = clicks.get(&person).map(Vec::as_slice).unwrap_or(&[]);
-        let mut i = 0;
-        while i < list.len() {
-            let session_start = list[i].ts;
-            let mut j = i + 1;
-            while j < list.len() && list[j].ts - list[j-1].ts <= 1_800_000 { j += 1; }
-            let day = session_start.div_euclid(DAY) as i32;
-            let user = users.entry((person.clone(), day)).or_default();
-            user.sessions += 1;
-            user.events += (j - i) as i64;
-            let mut revenue = 0;
-            let mut purchasing = false;
-            for e in &list[i..j] {
-                revenue += e.revenue;
-                if let Some(category) = &e.category { purchasing = true; *user.categories.entry(category.clone()).or_default() += e.revenue; }
+    // Each person's sessions are independent. Workers accumulate private daily
+    // totals, which avoids synchronization while traversing events and clicks.
+    let (users, totals) = events.into_par_iter().fold(
+        || (Vec::<((String, i32), UserDay)>::new(), HashMap::<(String, i32), CampaignDay>::new()),
+        |(mut users, mut totals), (person, mut list)| {
+            list.sort_unstable_by_key(|e| e.ts);
+            let person_clicks = clicks.get(&person).map(Vec::as_slice).unwrap_or(&[]);
+            let mut person_days = HashMap::<i32, UserDay>::new();
+            let mut i = 0;
+            while i < list.len() {
+                let session_start = list[i].ts;
+                let mut j = i + 1;
+                while j < list.len() && list[j].ts - list[j-1].ts <= 1_800_000 { j += 1; }
+                let day = session_start.div_euclid(DAY) as i32;
+                let user = person_days.entry(day).or_default();
+                user.sessions += 1;
+                user.events += (j - i) as i64;
+                let mut revenue = 0;
+                let mut purchasing = false;
+                for e in &list[i..j] {
+                    revenue += e.revenue;
+                    if let Some(category) = &e.category { purchasing = true; *user.categories.entry(category.clone()).or_default() += e.revenue; }
+                }
+                user.revenue += revenue;
+                let lo = person_clicks.partition_point(|c| c.ts < session_start - WEEK);
+                let hi = person_clicks.partition_point(|c| c.ts <= session_start);
+                let eligible = &person_clicks[lo..hi];
+                let credited = eligible.last().map(|last| {
+                    let first = eligible.partition_point(|c| c.ts < last.ts);
+                    eligible[first].campaign.as_str()
+                }).unwrap_or("organic");
+                let total = totals.entry((credited.to_owned(), day)).or_default();
+                total.sessions += 1; total.revenue += revenue; total.purchasing += i64::from(purchasing);
+                let assists: HashSet<&str> = eligible.iter().map(|c| c.campaign.as_str()).collect();
+                for campaign in assists { totals.entry((campaign.to_owned(), day)).or_default().assists += 1; }
+                i = j;
             }
-            user.revenue += revenue;
-            let lo = person_clicks.partition_point(|c| c.ts < session_start - WEEK);
-            let hi = person_clicks.partition_point(|c| c.ts <= session_start);
-            let eligible = &person_clicks[lo..hi];
-            let credited = eligible.last().map(|last| {
-                let first = eligible.partition_point(|c| c.ts < last.ts);
-                eligible[first].campaign.as_str()
-            }).unwrap_or("organic");
-            let total = totals.entry((credited.to_owned(), day)).or_default();
-            total.sessions += 1; total.revenue += revenue; total.purchasing += i64::from(purchasing);
-            let assists: HashSet<&str> = eligible.iter().map(|c| c.campaign.as_str()).collect();
-            for campaign in assists { totals.entry((campaign.to_owned(), day)).or_default().assists += 1; }
-            i = j;
+            users.extend(person_days.into_iter().map(|(day, user)| ((person.clone(), day), user)));
+            (users, totals)
         }
-    }
+    ).reduce(
+        || (Vec::new(), HashMap::new()),
+        |(mut users, mut totals), (other_users, other_totals)| {
+            users.extend(other_users);
+            for (key, other) in other_totals {
+                let total = totals.entry(key).or_default();
+                total.sessions += other.sessions; total.purchasing += other.purchasing;
+                total.revenue += other.revenue; total.assists += other.assists;
+            }
+            (users, totals)
+        }
+    );
     mark!("sessions and attribution");
     let mut user_ids = Vec::new(); let mut user_days = Vec::new(); let mut sessions = Vec::new(); let mut event_counts = Vec::new(); let mut revenues = Vec::new(); let mut categories = Vec::new();
     for ((id, day), u) in users {
