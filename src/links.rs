@@ -36,6 +36,13 @@ impl Links {
         self.sizes[a] += self.sizes[b];
         if self.names[b] < self.names[a] { self.names[a] = self.names[b].clone(); }
     }
+    /// Resolve a name without mutating the union-find; safe to call concurrently.
+    pub fn name_shared<'a>(&'a self, id: &'a str) -> &'a str {
+        let Some(&mut_index) = self.ids.get(id) else { return id; };
+        let mut index = mut_index;
+        while self.parents[index] != index { index = self.parents[index]; }
+        &self.names[index]
+    }
     /// Unlinked IDs name themselves.
     pub fn name<'a>(&'a mut self, id: &'a str) -> &'a str {
         match self.ids.get(id).copied() {
@@ -51,6 +58,8 @@ mod tests {
         let mut links = Links::default();
         links.join("z", "y"); links.join("x", "y"); links.join("A", "x");
         links.join("", "0"); links.join("z", "z");
+        assert_eq!(links.name_shared("z"), "A");
+        assert_eq!(links.name_shared("unlinked"), "unlinked");
         assert_eq!(links.name("z"), "A");
         assert_eq!(links.name("x"), "A");
         assert_eq!(links.name("0"), "0");

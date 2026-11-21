@@ -3,6 +3,7 @@ use arrow_array::{ArrayRef, Date32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
 use shopping_sessions::{csv::parse_line, links::Links, timestamp::parse_ms};
+use rayon::prelude::*;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const DAY: i64 = 86_400_000;
@@ -60,6 +61,8 @@ fn string_field(name: &str, nullable: bool) -> Field { Field::new(name, DataType
 fn int_field(name: &str) -> Field { Field::new(name, DataType::Int64, false) }
 fn main() { if let Err(e) = run() { eprintln!("shopping-sessions: {e}"); std::process::exit(1); } }
 fn run() -> Result<()> {
+    let threads = env::var("NCPU").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0).unwrap_or(8);
+    rayon::ThreadPoolBuilder::new().num_threads(threads).build_global()?;
     let mut timer = std::time::Instant::now();
     let timing = env::var_os("SHOPPING_TIMING").is_some();
     macro_rules! mark { ($label:expr) => { if timing { eprintln!("{}: {:.3}s", $label, timer.elapsed().as_secs_f64()); timer = std::time::Instant::now(); } }; }
@@ -83,19 +86,21 @@ fn run() -> Result<()> {
         } Ok(())
     })?; }
     mark!("read and deduplicate events");
-    let mut events = HashMap::<String, Vec<Event>>::new();
-    for (_, e) in raw_events {
+    // Validate retained rows concurrently, then group them by resolved person.
+    let validated: Vec<(String, Event)> = raw_events.into_par_iter().filter_map(|(_, e)| {
         let r = parse_line(&e.line, 7).expect("stored row was parsed already");
-        if r[1].is_empty() || r[5].is_empty() { continue; }
-        let Some(ts) = parse_ms(r[2]) else { continue; };
-        if ts < start || ts >= end || e.ingest - ts > DAY { continue; }
+        if r[1].is_empty() || r[5].is_empty() { return None; }
+        let ts = parse_ms(r[2])?;
+        if ts < start || ts >= end || e.ingest - ts > DAY { return None; }
         let (revenue, category) = match r[4] {
             "view" | "cart" => (0, None),
-            "purchase" => { let Some(p) = price(r[6]) else { continue; }; (p, Some(products.get(r[5]).cloned().unwrap_or_else(|| "unknown".into()))) },
-            _ => continue,
+            "purchase" => (price(r[6])?, Some(products.get(r[5]).cloned().unwrap_or_else(|| "unknown".into()))),
+            _ => return None,
         };
-        events.entry(links.name(r[1]).to_owned()).or_default().push(Event { ts, revenue, category });
-    }
+        Some((links.name_shared(r[1]).to_owned(), Event { ts, revenue, category }))
+    }).collect();
+    let mut events = HashMap::<String, Vec<Event>>::new();
+    for (person, event) in validated { events.entry(person).or_default().push(event); }
     mark!("validate and group events");
     let mut seen = HashSet::new();
     let mut clicks = HashMap::<String, Vec<Click>>::new();
