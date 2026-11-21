@@ -1,5 +1,5 @@
 //! Transitive ID links, named by the byte-wise smallest member.
-use std::collections::HashMap;
+type HashMap<K, V> = std::collections::HashMap<K, V, ahash::RandomState>;
 
 #[derive(Default)]
 pub struct Links {

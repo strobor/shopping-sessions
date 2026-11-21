@@ -14,3 +14,13 @@ Earlier timings below were single local runs unless stated otherwise. They were 
 | Parallel session aggregation (`b99f536`) | Seed 2, 20M | 40.42 s | 6.6 GiB | Fixtures, dev answer, and previous 20M output matched. Kept. |
 | Parallel session aggregation (`b99f536`) | Seed 3, 60M | 164.08 s | 20.2 GiB | Completed; both tables' session and revenue totals agreed. No full-size reference answer. |
 | Fixed-size CSV field arrays, on `b99f536` | Seed 2, 20M | 43.98 s | 6.6 GiB | Fixtures and dev answer matched; slower in one run, so discarded pending stronger evidence. |
+
+## Repeated practice-scale experiments
+
+Both experiments used seed 2 (20M events, 5M clicks), eight CPUs, three repetitions, and exact comparison with the earlier output. See `runs.jsonl` for the binary hashes, machine details, per-run measurements, and stage medians.
+
+| Experiment | Median | Peak RSS | Decision |
+| --- | ---: | ---: | --- |
+| Recorded baseline (`b99f536`) | 40.40 s | 6.58 GiB | Reference for this series; all three comparisons passed. |
+| aHash with exact key comparisons | 37.95 s | 6.60 GiB | All comparisons passed; retained as a modest improvement. |
+| Parallel click reading and sorting on aHash | 33.74 s | 6.57 GiB | All comparisons passed; retained for a leaderboard trial. Timing differences can still include machine variation. |

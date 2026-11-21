@@ -1,9 +1,12 @@
-use std::{collections::{HashMap, HashSet}, env, error::Error, fs::{self, File}, io::{BufRead, BufReader}, path::{Path, PathBuf}, sync::Arc};
+use std::{collections::{HashMap as StdHashMap, HashSet as StdHashSet}, env, error::Error, fs::{self, File}, io::{BufRead, BufReader}, path::{Path, PathBuf}, sync::Arc};
 use arrow_array::{ArrayRef, Date32Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use parquet::arrow::ArrowWriter;
 use shopping_sessions::{csv::parse_line, links::Links, timestamp::parse_ms};
 use rayon::prelude::*;
+
+type HashMap<K, V> = StdHashMap<K, V, ahash::RandomState>;
+type HashSet<K> = StdHashSet<K, ahash::RandomState>;
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 const DAY: i64 = 86_400_000;
@@ -31,7 +34,7 @@ fn read_rows(path: &Path, count: usize, mut f: impl FnMut(Vec<&str>, &str) -> Re
     Ok(())
 }
 fn dimensions(path: &Path) -> Result<HashMap<String, String>> {
-    let mut result = HashMap::new();
+    let mut result = HashMap::default();
     read_rows(path, 2, |r, _line| { result.insert(r[0].into(), r[1].into()); Ok(()) })?;
     Ok(result)
 }
@@ -79,7 +82,7 @@ fn run() -> Result<()> {
     // Deduplicate within each file in parallel, then reconcile IDs across files.
     let event_files = files(&data.join("events"))?;
     let partials: Vec<Result<HashMap<String, RawEvent>>> = event_files.par_iter().map(|path| {
-        let mut local = HashMap::<String, RawEvent>::new();
+        let mut local = HashMap::<String, RawEvent>::default();
         read_rows(path, 7, |r, line| {
             if !r[0].is_empty() {
                 let ingest = parse_ms(r[3]).ok_or("bad ingest timestamp")?;
@@ -90,7 +93,7 @@ fn run() -> Result<()> {
         })?;
         Ok(local)
     }).collect();
-    let mut raw_events = HashMap::<String, RawEvent>::new();
+    let mut raw_events = HashMap::<String, RawEvent>::default();
     for partial in partials {
         for (id, event) in partial? {
             use std::collections::hash_map::Entry;
@@ -115,28 +118,42 @@ fn run() -> Result<()> {
         };
         Some((links.name_shared(r[1]).to_owned(), Event { ts, revenue, category }))
     }).collect();
-    let mut events = HashMap::<String, Vec<Event>>::new();
+    let mut events = HashMap::<String, Vec<Event>>::default();
     for (person, event) in validated { events.entry(person).or_default().push(event); }
     mark!("validate and group events");
-    let mut seen = HashSet::new();
-    let mut clicks = HashMap::<String, Vec<Click>>::new();
-    for path in files(&data.join("clicks"))? { read_rows(&path, 4, |r, _line| {
-        if r[0].is_empty() || !seen.insert(r[0].to_owned()) || r[1].is_empty() || !campaigns.contains_key(r[2]) { return Ok(()); }
-        let Some(ts) = parse_ms(r[3]) else { return Ok(()); };
-        if ts < start - WEEK || ts >= end { return Ok(()); }
-        clicks.entry(links.name(r[1]).to_owned()).or_default().push(Click { ts, id:r[0].into(), campaign:r[2].into() });
-        Ok(())
-    })?; }
-    for list in clicks.values_mut() { list.sort_unstable_by(|a,b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id))); }
+    let mut seen = HashSet::default();
+    let mut clicks = HashMap::<String, Vec<Click>>::default();
+    let click_files = files(&data.join("clicks"))?;
+    // Valid copies of a click have identical values. Read and validate files in
+    // bounded batches, then deduplicate globally before grouping by person.
+    for batch in click_files.chunks(threads) {
+        let partials: Vec<Result<Vec<(String, Click)>>> = batch.par_iter().map(|path| {
+            let mut local = Vec::new();
+            read_rows(path, 4, |r, _line| {
+                if r[0].is_empty() || r[1].is_empty() || !campaigns.contains_key(r[2]) { return Ok(()); }
+                let Some(ts) = parse_ms(r[3]) else { return Ok(()); };
+                if ts < start - WEEK || ts >= end { return Ok(()); }
+                local.push((links.name_shared(r[1]).to_owned(), Click { ts, id:r[0].into(), campaign:r[2].into() }));
+                Ok(())
+            })?;
+            Ok(local)
+        }).collect();
+        for partial in partials {
+            for (person, click) in partial? {
+                if seen.insert(click.id.clone()) { clicks.entry(person).or_default().push(click); }
+            }
+        }
+    }
+    clicks.par_iter_mut().for_each(|(_, list)| list.sort_unstable_by(|a,b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id))));
     mark!("read and sort clicks");
     // Each person's sessions are independent. Workers accumulate private daily
     // totals, which avoids synchronization while traversing events and clicks.
     let (users, totals) = events.into_par_iter().fold(
-        || (Vec::<((String, i32), UserDay)>::new(), HashMap::<(String, i32), CampaignDay>::new()),
+        || (Vec::<((String, i32), UserDay)>::default(), HashMap::<(String, i32), CampaignDay>::default()),
         |(mut users, mut totals), (person, mut list)| {
             list.sort_unstable_by_key(|e| e.ts);
             let person_clicks = clicks.get(&person).map(Vec::as_slice).unwrap_or(&[]);
-            let mut person_days = HashMap::<i32, UserDay>::new();
+            let mut person_days = HashMap::<i32, UserDay>::default();
             let mut i = 0;
             while i < list.len() {
                 let session_start = list[i].ts;
@@ -170,7 +187,7 @@ fn run() -> Result<()> {
             (users, totals)
         }
     ).reduce(
-        || (Vec::new(), HashMap::new()),
+        || (Vec::new(), HashMap::default()),
         |(mut users, mut totals), (other_users, other_totals)| {
             users.extend(other_users);
             for (key, other) in other_totals {
