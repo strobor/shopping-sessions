@@ -5,7 +5,7 @@ use parquet::arrow::ArrowWriter;
 use shopping_sessions::{csv::parse_line, links::Links, timestamp::parse_ms};
 use rayon::prelude::*;
 
-type Result<T> = std::result::Result<T, Box<dyn Error>>;
+type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 
@@ -76,15 +76,31 @@ fn run() -> Result<()> {
     let mut links = Links::default();
     for path in files(&data.join("links"))? { read_rows(&path, 2, |r, _line| { links.join(r[0], r[1]); Ok(()) })?; }
     mark!("dimensions and links");
+    // Deduplicate within each file in parallel, then reconcile IDs across files.
+    let event_files = files(&data.join("events"))?;
+    let partials: Vec<Result<HashMap<String, RawEvent>>> = event_files.par_iter().map(|path| {
+        let mut local = HashMap::<String, RawEvent>::new();
+        read_rows(path, 7, |r, line| {
+            if !r[0].is_empty() {
+                let ingest = parse_ms(r[3]).ok_or("bad ingest timestamp")?;
+                let replace = local.get(r[0]).is_none_or(|old| ingest < old.ingest);
+                if replace { local.insert(r[0].into(), RawEvent { line: line.to_owned(), ingest }); }
+            }
+            Ok(())
+        })?;
+        Ok(local)
+    }).collect();
     let mut raw_events = HashMap::<String, RawEvent>::new();
-    for path in files(&data.join("events"))? { read_rows(&path, 7, |r, _line| {
-        if !r[0].is_empty() {
-            // Ingest timestamps are guaranteed valid by the input contract.
-            let ingest = parse_ms(r[3]).ok_or("bad ingest timestamp")?;
-            let replace = raw_events.get(r[0]).is_none_or(|old| ingest < old.ingest);
-            if replace { raw_events.insert(r[0].into(), RawEvent { line: _line.to_owned(), ingest }); }
-        } Ok(())
-    })?; }
+    for partial in partials {
+        for (id, event) in partial? {
+            use std::collections::hash_map::Entry;
+            match raw_events.entry(id) {
+                Entry::Vacant(slot) => { slot.insert(event); }
+                Entry::Occupied(mut slot) if event.ingest < slot.get().ingest => { slot.insert(event); }
+                _ => {}
+            }
+        }
+    }
     mark!("read and deduplicate events");
     // Validate retained rows concurrently, then group them by resolved person.
     let validated: Vec<(String, Event)> = raw_events.into_par_iter().filter_map(|(_, e)| {
